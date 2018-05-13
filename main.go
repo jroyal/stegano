@@ -1,7 +1,12 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -15,6 +20,58 @@ import (
 	"path/filepath"
 	"strconv"
 )
+
+func createEncyptionKey(password []byte) *[32]byte {
+	key := [32]byte{}
+	h := sha256.New()
+	h.Write(password)
+	copy(key[:], h.Sum(nil))
+	return &key
+}
+
+// encrypts data using 256-bit AES-GCM
+func encrypt(plaintext []byte, key *[32]byte) (ciphertext []byte, err error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	_, err = io.ReadFull(rand.Reader, nonce)
+	if err != nil {
+		return nil, err
+	}
+
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// decrypts data using 256-bit AES-GCM.
+func decrypt(ciphertext []byte, key *[32]byte) (plaintext []byte, err error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ciphertext) < gcm.NonceSize() {
+		return nil, errors.New("malformed ciphertext")
+	}
+
+	return gcm.Open(nil,
+		ciphertext[:gcm.NonceSize()],
+		ciphertext[gcm.NonceSize():],
+		nil,
+	)
+}
 
 // printBits is a quick way to get binary representation of a value
 func printBits(n uint32) {
@@ -111,10 +168,10 @@ func assemble(data []uint8) []byte {
 }
 
 // decode takes an image and prints the payload that was encoded
-func decode(r io.Reader) error {
+func decode(r io.Reader) ([]byte, error) {
 	img, err := png.Decode(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	bounds := img.Bounds()
 	cimg := image.NewRGBA(bounds)
@@ -130,8 +187,7 @@ func decode(r io.Reader) error {
 		}
 	}
 	out := assemble(data)
-	fmt.Println(string(out))
-	return nil
+	return out, nil
 }
 
 func main() {
@@ -139,17 +195,16 @@ func main() {
 		fmt.Println("encode or decode subcommand is required")
 		os.Exit(1)
 	}
-	encodeCommand := flag.NewFlagSet("encode", flag.ExitOnError)
-	textPayload := encodeCommand.String("text", "", "text you want to encode into the image (required)")
-	encInputFile := encodeCommand.String("input", "", "base image file used to store your payload (required)")
-	encOutputFile := encodeCommand.String("output", "", "output destination for your new image (required)")
 
-	decodeCommand := flag.NewFlagSet("decode", flag.ExitOnError)
-	decInputFile := decodeCommand.String("input", "", "image file where payload is thought to be")
 	switch os.Args[1] {
 	case "encode":
+		encodeCommand := flag.NewFlagSet("encode", flag.ExitOnError)
+		secret := encodeCommand.String("secret", "", "The secret to be used when encrypting your payload (required)")
+		textPayload := encodeCommand.String("text", "", "text you want to encode into the image (required)")
+		encInputFile := encodeCommand.String("input", "", "base image file used to store your payload (required)")
+		encOutputFile := encodeCommand.String("output", "", "output destination for your new image (required)")
 		encodeCommand.Parse(os.Args[2:])
-		if *encInputFile == "" || *encOutputFile == "" || *textPayload == "" {
+		if *encInputFile == "" || *encOutputFile == "" || *textPayload == "" || *secret == "" {
 			encodeCommand.PrintDefaults()
 			os.Exit(2)
 		}
@@ -166,20 +221,35 @@ func main() {
 			log.Fatal(err)
 		}
 		defer writer.Close()
-
-		payload := []byte(*textPayload)
+		key := createEncyptionKey([]byte(*secret))
+		payload, err := encrypt([]byte(*textPayload), key)
+		if err != nil {
+			log.Fatal(err)
+		}
 		err = encode(writer, reader, payload)
 		if err != nil {
 			log.Fatal(err)
 		}
 	case "decode":
+		decodeCommand := flag.NewFlagSet("decode", flag.ExitOnError)
+		secret := decodeCommand.String("secret", "", "The secret to be used when encrypting your payload (required)")
+		decInputFile := decodeCommand.String("input", "", "image file where payload is thought to be")
 		decodeCommand.Parse(os.Args[2:])
 		input, _ := filepath.Abs(*decInputFile)
 		reader, err := os.Open(input)
 		if err != nil {
 			log.Fatal(err)
 		}
-		decode(reader)
+		payload, err := decode(reader)
+		if err != nil {
+			log.Fatal(err)
+		}
+		key := createEncyptionKey([]byte(*secret))
+		payload, err = decrypt([]byte(payload), key)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(string(payload))
 	default:
 		fmt.Println("encode or decode subcommand is required")
 		os.Exit(2)
